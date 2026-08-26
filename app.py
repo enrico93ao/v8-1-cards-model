@@ -1,7 +1,7 @@
 import os
 import re
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from statistics import median
 from zoneinfo import ZoneInfo
@@ -22,37 +22,46 @@ st.set_page_config(
     layout="wide",
 )
 
-API_BASE = "https://v3.football.api-sports.io"
-API_KEY = os.getenv("API_FOOTBALL_KEY")
+ODDSPAPI_KEY = os.getenv("ODDSPAPI_KEY")
+ODDSPAPI_BASE = "https://api.oddspapi.io/v4"
 
-TZ = ZoneInfo("Europe/Rome")
+SOCCER_ID = 10
+TZ_ITALY = ZoneInfo("Europe/Rome")
+
+# Usiamo due bookmaker per avere un input 1X2 robusto
+BOOKMAKERS = "pinnacle,sbobet"
 
 BIG5 = {
     "Premier League": {
-        "api_id": 39,
+        "tournament_name": "Premier League",
+        "country": "England",
         "model_id": "E0",
     },
-    "Bundesliga": {
-        "api_id": 78,
-        "model_id": "D1",
-    },
     "La Liga": {
-        "api_id": 140,
+        "tournament_name": "LaLiga",
+        "country": "Spain",
         "model_id": "SP1",
     },
+    "Bundesliga": {
+        "tournament_name": "Bundesliga",
+        "country": "Germany",
+        "model_id": "D1",
+    },
     "Serie A": {
-        "api_id": 135,
+        "tournament_name": "Serie A",
+        "country": "Italy",
         "model_id": "I1",
     },
     "Ligue 1": {
-        "api_id": 61,
+        "tournament_name": "Ligue 1",
+        "country": "France",
         "model_id": "F1",
     },
 }
 
 
 # ============================================================
-# LOAD MODEL
+# MODEL
 # ============================================================
 
 @st.cache_resource
@@ -63,25 +72,39 @@ def get_bundle():
 bundle = get_bundle()
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+def pct(value):
+    return f"{float(value) * 100:.1f}%"
 
-def pct(x):
-    return f"{x * 100:.1f}%"
 
+# ============================================================
+# NAME MATCHING
+# ============================================================
 
 def normalize_name(name):
     if not name:
         return ""
 
-    name = unicodedata.normalize("NFKD", str(name))
-    name = "".join(c for c in name if not unicodedata.combining(c))
-    name = name.lower()
-    name = name.replace("&", " and ")
-    name = re.sub(r"[^a-z0-9]+", " ", name)
+    value = unicodedata.normalize("NFKD", str(name))
+    value = "".join(
+        c for c in value
+        if not unicodedata.combining(c)
+    )
 
-    return " ".join(name.split())
+    value = value.lower()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+
+    removable = {
+        "fc", "afc", "cf", "ac", "as",
+        "ssc", "club", "football"
+    }
+
+    words = [
+        w for w in value.split()
+        if w not in removable
+    ]
+
+    return " ".join(words)
 
 
 RAW_ALIASES = {
@@ -100,25 +123,31 @@ RAW_ALIASES = {
     "Real Sociedad": "Sociedad",
     "Athletic Club": "Ath Bilbao",
     "Atletico Madrid": "Ath Madrid",
+    "Atlético Madrid": "Ath Madrid",
     "Real Betis": "Betis",
+    "Espanyol Barcelona": "Espanol",
     "RCD Espanyol": "Espanol",
     "Celta Vigo": "Celta",
+    "RC Celta de Vigo": "Celta",
     "Rayo Vallecano": "Vallecano",
     "Deportivo Alaves": "Alaves",
+    "Deportivo Alavés": "Alaves",
     "Real Mallorca": "Mallorca",
 
     # Bundesliga
     "Borussia Monchengladbach": "M'gladbach",
+    "Borussia Mönchengladbach": "M'gladbach",
     "Eintracht Frankfurt": "Ein Frankfurt",
     "Bayer Leverkusen": "Leverkusen",
     "Borussia Dortmund": "Dortmund",
     "1899 Hoffenheim": "Hoffenheim",
+    "TSG Hoffenheim": "Hoffenheim",
     "1. FC Heidenheim": "Heidenheim",
     "FC St. Pauli": "St Pauli",
 
     # Serie A
-    "Inter": "Inter",
     "Internazionale": "Inter",
+    "Inter Milan": "Inter",
     "AC Milan": "Milan",
     "AS Roma": "Roma",
     "Hellas Verona": "Verona",
@@ -127,6 +156,7 @@ RAW_ALIASES = {
     "Paris Saint Germain": "Paris SG",
     "Paris Saint-Germain": "Paris SG",
     "Olympique Marseille": "Marseille",
+    "Olympique de Marseille": "Marseille",
     "Olympique Lyonnais": "Lyon",
     "Stade Rennais": "Rennes",
     "AS Monaco": "Monaco",
@@ -144,613 +174,532 @@ TEAM_ALIASES = {
 def get_model_teams(model_league):
     return sorted({
         team
-        for league, team in bundle["state"]["team_hist"].keys()
+        for league, team
+        in bundle["state"]["team_hist"].keys()
         if league == model_league
     })
 
 
 def match_model_team(api_name, model_league):
-    """
-    Traduce il nome API-Football nel nome usato dal bundle V8.1.
-    """
-
     candidates = get_model_teams(model_league)
 
     if not candidates:
         return None
 
-    q = normalize_name(api_name)
-
-    by_normalized = {
+    normalized_candidates = {
         normalize_name(team): team
         for team in candidates
     }
 
-    # Match esatto
-    if q in by_normalized:
-        return by_normalized[q]
+    query = normalize_name(api_name)
 
-    # Alias noto
-    alias = TEAM_ALIASES.get(q)
+    # 1. Exact match
+    if query in normalized_candidates:
+        return normalized_candidates[query]
+
+    # 2. Alias
+    alias = TEAM_ALIASES.get(query)
 
     if alias:
-        alias_norm = normalize_name(alias)
+        alias_normalized = normalize_name(alias)
 
-        if alias_norm in by_normalized:
-            return by_normalized[alias_norm]
+        if alias_normalized in normalized_candidates:
+            return normalized_candidates[alias_normalized]
 
-    # Fuzzy fallback
+    # 3. Fuzzy fallback
     best_team = None
-    best_score = 0
+    best_score = 0.0
 
-    for candidate in candidates:
+    for team in candidates:
         score = SequenceMatcher(
             None,
-            q,
-            normalize_name(candidate)
+            query,
+            normalize_name(team),
         ).ratio()
 
         if score > best_score:
             best_score = score
-            best_team = candidate
+            best_team = team
 
-    # Manteniamo una soglia piuttosto prudente
-    if best_score >= 0.82:
+    if best_score >= 0.80:
         return best_team
 
     return None
 
 
 # ============================================================
-# API-FOOTBALL
+# ODDSPAPI
 # ============================================================
 
-def api_get(endpoint, params=None):
-    if not API_KEY:
+def oddspapi_get(endpoint, params=None):
+    if not ODDSPAPI_KEY:
         raise RuntimeError(
-            "API_FOOTBALL_KEY non trovata nelle variabili Environment di Render."
+            "ODDSPAPI_KEY non trovata nelle Environment Variables di Render."
         )
 
+    final_params = dict(params or {})
+    final_params["apiKey"] = ODDSPAPI_KEY
+
     response = requests.get(
-        API_BASE + endpoint,
-        headers={
-            "x-apisports-key": API_KEY
-        },
-        params=params or {},
-        timeout=25,
+        f"{ODDSPAPI_BASE}/{endpoint}",
+        params=final_params,
+        timeout=35,
     )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "OddsPapi: limite temporaneo di richieste raggiunto. "
+            "Riprova tra poco."
+        )
 
     response.raise_for_status()
 
     data = response.json()
 
-    errors = data.get("errors")
-
-    if errors:
+    if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(
-            f"API-Football error: {errors}"
+            f"OddsPapi: {data.get('error')}"
         )
 
     return data
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_fixtures(
-    league_api_id,
-    season,
-    date_from,
-    date_to
-):
-    data = api_get(
-        "/fixtures",
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_tournaments():
+    return oddspapi_get(
+        "tournaments",
         {
-            "league": league_api_id,
-            "season": season,
-            "from": date_from,
-            "to": date_to,
-            "timezone": "Europe/Rome",
+            "sportId": SOCCER_ID,
+            "language": "en",
         },
     )
 
-    return data.get("response", [])
 
+def resolve_big5_tournaments():
+    tournaments = fetch_tournaments()
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_match_winner_bet_id():
-    """
-    Recupera dinamicamente l'ID del mercato Match Winner.
-    """
+    resolved = {}
+    missing = []
 
-    data = api_get(
-        "/odds/bets",
-        {
-            "search": "Match Winner"
-        }
-    )
+    for display_name, cfg in BIG5.items():
+        found = None
 
-    for item in data.get("response", []):
-        name = str(item.get("name", "")).lower()
+        for tournament in tournaments:
+            t_name = str(
+                tournament.get("tournamentName", "")
+            ).strip()
 
-        if "match winner" in name:
-            return item.get("id")
+            country = str(
+                tournament.get("categoryName", "")
+            ).strip()
 
-    return None
+            if (
+                t_name.lower()
+                == cfg["tournament_name"].lower()
+                and country.lower()
+                == cfg["country"].lower()
+            ):
+                found = tournament
+                break
+
+        if found:
+            resolved[int(found["tournamentId"])] = {
+                **cfg,
+                "display_name": display_name,
+                "tournament_id": int(
+                    found["tournamentId"]
+                ),
+            }
+        else:
+            missing.append(display_name)
+
+    return resolved, missing
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def fetch_odds_for_date(
-    league_api_id,
-    season,
-    date_string,
-    bet_id
-):
+def fetch_upcoming_fixtures():
     """
-    Una richiesta per campionato/data invece di una richiesta
-    per ogni singola partita.
+    Recuperiamo sempre i prossimi 7 giorni.
+    Il selettore 3/5/7 giorni filtra poi localmente,
+    senza generare altre richieste API.
     """
 
-    params = {
-        "league": league_api_id,
-        "season": season,
-        "date": date_string,
-    }
+    now_utc = datetime.now(timezone.utc)
 
-    if bet_id is not None:
-        params["bet"] = bet_id
-
-    first = api_get(
-        "/odds",
-        params
+    end_utc = (
+        now_utc + timedelta(days=7)
     )
 
-    results = list(
-        first.get("response", [])
+    from_iso = (
+        now_utc
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
-    paging = first.get("paging", {})
-    total_pages = int(
-        paging.get("total", 1) or 1
+    to_iso = (
+        end_utc
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
-    # Generalmente Big Five/date = una pagina,
-    # ma gestiamo eventuale paginazione.
-    for page in range(2, total_pages + 1):
-
-        page_params = dict(params)
-        page_params["page"] = page
-
-        data = api_get(
-            "/odds",
-            page_params
-        )
-
-        results.extend(
-            data.get("response", [])
-        )
-
-    return results
+    return oddspapi_get(
+        "fixtures",
+        {
+            "sportId": SOCCER_ID,
+            "from": from_iso,
+            "to": to_iso,
+            "statusId": 0,
+            "hasOdds": "true",
+            "language": "en",
+        },
+    )
 
 
-def extract_1x2(odds_item, bet_id):
-    """
-    Usa la mediana delle quote disponibili tra i bookmaker.
-    È più robusto che dipendere da un singolo bookmaker.
-    """
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_big5_odds(tournament_ids):
+    ids = ",".join(
+        str(x)
+        for x in tournament_ids
+    )
 
-    homes = []
-    draws = []
-    aways = []
+    data = oddspapi_get(
+        "odds-by-tournaments",
+        {
+            "tournamentIds": ids,
+            "bookmakers": BOOKMAKERS,
+            "language": "en",
+            "verbosity": 3,
+            "oddsFormat": "decimal",
+        },
+    )
 
-    valid_books = 0
+    # La risposta normalmente è una lista.
+    # Gestiamo anche eventuali wrapper.
+    if isinstance(data, list):
+        return data
 
-    for bookmaker in odds_item.get(
-        "bookmakers",
-        []
-    ):
+    if isinstance(data, dict):
+        for key in ("response", "fixtures", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
 
-        for bet in bookmaker.get(
-            "bets",
-            []
-        ):
+        # Eventuale singolo fixture
+        if data.get("fixtureId"):
+            return [data]
 
-            current_id = bet.get("id")
-            current_name = str(
-                bet.get("name", "")
-            ).lower()
-
-            correct_bet = False
-
-            if bet_id is not None:
-                correct_bet = current_id == bet_id
-
-            if "match winner" in current_name:
-                correct_bet = True
-
-            if not correct_bet:
-                continue
-
-            h = None
-            d = None
-            a = None
-
-            for value in bet.get(
-                "values",
-                []
-            ):
-
-                label = str(
-                    value.get("value", "")
-                ).strip().lower()
-
-                try:
-                    odd = float(
-                        value.get("odd")
-                    )
-                except Exception:
-                    continue
-
-                if label in (
-                    "home",
-                    "1"
-                ):
-                    h = odd
-
-                elif label in (
-                    "draw",
-                    "x"
-                ):
-                    d = odd
-
-                elif label in (
-                    "away",
-                    "2"
-                ):
-                    a = odd
-
-            if (
-                h is not None
-                and d is not None
-                and a is not None
-            ):
-                homes.append(h)
-                draws.append(d)
-                aways.append(a)
-
-                valid_books += 1
-
-    if not homes:
-        return None
-
-    return {
-        "home": float(median(homes)),
-        "draw": float(median(draws)),
-        "away": float(median(aways)),
-        "bookmakers": valid_books,
-    }
+    return []
 
 
 # ============================================================
-# V8.1 SCANNER
+# 1X2 EXTRACTION
 # ============================================================
 
-def best_market(
-    prediction,
-    display_home,
-    display_away
-):
-    markets = prediction["markets"]
+def get_price_from_outcome(outcome):
+    players = outcome.get("players") or {}
 
-    possibilities = [
-        (
-            "Over 2.5 cartellini",
-            markets["match_O2.5"]
-        ),
-        (
-            "Under 3.5 cartellini",
-            markets["match_U3.5"]
-        ),
-        (
-            f"{display_home} Over 1.5 cartellini",
-            markets["home_team_O1.5"]
-        ),
-        (
-            f"{display_home} Under 1.5 cartellini",
-            markets["home_team_U1.5"]
-        ),
-        (
-            f"{display_away} Over 1.5 cartellini",
-            markets["away_team_O1.5"]
-        ),
-        (
-            f"{display_away} Under 1.5 cartellini",
-            markets["away_team_U1.5"]
-        ),
-    ]
+    prices = []
 
-    return max(
-        possibilities,
-        key=lambda x: x[1]
-    )
-
-
-def historical_coverage(
-    model_league,
-    home,
-    away
-):
-    state = bundle["state"]
-
-    home_hist = state[
-        "team_hist"
-    ].get(
-        (model_league, home),
-        {}
-    ).get(
-        "cards",
-        []
-    )
-
-    away_hist = state[
-        "team_hist"
-    ].get(
-        (model_league, away),
-        {}
-    ).get(
-        "cards",
-        []
-    )
-
-    home_n = min(
-        20,
-        len(home_hist)
-    )
-
-    away_n = min(
-        20,
-        len(away_hist)
-    )
-
-    coverage = (
-        home_n + away_n
-    ) / 40.0
-
-    return (
-        coverage,
-        home_n,
-        away_n
-    )
-
-
-def parse_kickoff(date_string):
-    try:
-        dt = datetime.fromisoformat(
-            date_string.replace(
-                "Z",
-                "+00:00"
-            )
-        )
-
-        dt = dt.astimezone(TZ)
-
-        return dt.strftime(
-            "%d/%m • %H:%M"
-        )
-
-    except Exception:
-        return date_string
-
-
-def run_scanner(days):
-    now = datetime.now(TZ)
-
-    start_date = now.date()
-
-    end_date = (
-        start_date
-        + timedelta(days=days - 1)
-    )
-
-    # Big Five: stagione identificata
-    # dall'anno di inizio.
-    season = (
-        now.year
-        if now.month >= 7
-        else now.year - 1
-    )
-
-    fixtures = []
-    skipped = []
-
-    # --------------------------------
-    # FIXTURES
-    # --------------------------------
-
-    for league_name, cfg in BIG5.items():
-
-        items = fetch_fixtures(
-            cfg["api_id"],
-            season,
-            start_date.isoformat(),
-            end_date.isoformat(),
-        )
-
-        for item in items:
-
-            fixture = item.get(
-                "fixture",
-                {}
-            )
-
-            status = fixture.get(
-                "status",
-                {}
-            ).get(
-                "short"
-            )
-
-            # Solo match non iniziati
-            if status != "NS":
-                continue
-
-            teams = item.get(
-                "teams",
-                {}
-            )
-
-            api_home = teams.get(
-                "home",
-                {}
-            ).get(
-                "name"
-            )
-
-            api_away = teams.get(
-                "away",
-                {}
-            ).get(
-                "name"
-            )
-
-            model_home = match_model_team(
-                api_home,
-                cfg["model_id"]
-            )
-
-            model_away = match_model_team(
-                api_away,
-                cfg["model_id"]
-            )
-
-            if (
-                not model_home
-                or not model_away
-            ):
-
-                skipped.append({
-                    "match": f"{api_home} - {api_away}",
-                    "reason": "Nome squadra non riconosciuto",
-                })
-
-                continue
-
-            fixtures.append({
-                "fixture_id": fixture.get("id"),
-                "league_name": league_name,
-                "league_api": cfg["api_id"],
-                "league_model": cfg["model_id"],
-                "date": str(
-                    fixture.get(
-                        "date",
-                        ""
-                    )
-                )[:10],
-                "kickoff_raw": fixture.get(
-                    "date",
-                    ""
-                ),
-                "api_home": api_home,
-                "api_away": api_away,
-                "model_home": model_home,
-                "model_away": model_away,
-            })
-
-    # --------------------------------
-    # ODDS
-    # --------------------------------
-
-    bet_id = get_match_winner_bet_id()
-
-    groups = {}
-
-    for fixture in fixtures:
-
-        key = (
-            fixture["league_api"],
-            fixture["date"]
-        )
-
-        groups.setdefault(
-            key,
-            []
-        ).append(
-            fixture
-        )
-
-    odds_by_fixture = {}
-
-    for (
-        league_api,
-        date_string
-    ), group in groups.items():
-
-        items = fetch_odds_for_date(
-            league_api,
-            season,
-            date_string,
-            bet_id,
-        )
-
-        for item in items:
-
-            fixture_info = item.get(
-                "fixture",
-                {}
-            )
-
-            fixture_id = fixture_info.get(
-                "id"
-            )
-
-            odds = extract_1x2(
-                item,
-                bet_id
-            )
-
-            if odds:
-                odds_by_fixture[
-                    fixture_id
-                ] = odds
-
-    # --------------------------------
-    # PREDICTIONS
-    # --------------------------------
-
-    rankings = []
-
-    for fixture in fixtures:
-
-        fixture_id = fixture[
-            "fixture_id"
-        ]
-
-        odds = odds_by_fixture.get(
-            fixture_id
-        )
-
-        if not odds:
-
-            skipped.append({
-                "match":
-                    f"{fixture['api_home']} - {fixture['api_away']}",
-                "reason":
-                    "Quote 1X2 non disponibili",
-            })
-
+    for player in players.values():
+        if player.get("active") is False:
             continue
 
         try:
+            price = float(player.get("price"))
+        except (TypeError, ValueError):
+            continue
 
+        if price > 1.0:
+            prices.append(price)
+
+    if not prices:
+        return None
+
+    return median(prices)
+
+
+def extract_1x2(odds_item):
+    """
+    Market:
+    101 = Full Time Result
+
+    Outcomes:
+    101 = Home
+    102 = Draw
+    103 = Away
+    """
+
+    home_prices = []
+    draw_prices = []
+    away_prices = []
+
+    books_used = []
+
+    bookmaker_odds = (
+        odds_item.get("bookmakerOdds")
+        or {}
+    )
+
+    for bookmaker, bookmaker_data in bookmaker_odds.items():
+        if bookmaker_data.get("suspended") is True:
+            continue
+
+        markets = (
+            bookmaker_data.get("markets")
+            or {}
+        )
+
+        market = (
+            markets.get("101")
+            or markets.get(101)
+        )
+
+        if not market:
+            continue
+
+        if market.get("marketActive") is False:
+            continue
+
+        outcomes = (
+            market.get("outcomes")
+            or {}
+        )
+
+        home_outcome = (
+            outcomes.get("101")
+            or outcomes.get(101)
+            or {}
+        )
+
+        draw_outcome = (
+            outcomes.get("102")
+            or outcomes.get(102)
+            or {}
+        )
+
+        away_outcome = (
+            outcomes.get("103")
+            or outcomes.get(103)
+            or {}
+        )
+
+        h = get_price_from_outcome(home_outcome)
+        d = get_price_from_outcome(draw_outcome)
+        a = get_price_from_outcome(away_outcome)
+
+        if (
+            h is not None
+            and d is not None
+            and a is not None
+        ):
+            home_prices.append(h)
+            draw_prices.append(d)
+            away_prices.append(a)
+            books_used.append(bookmaker)
+
+    if not home_prices:
+        return None
+
+    return {
+        "home": float(median(home_prices)),
+        "draw": float(median(draw_prices)),
+        "away": float(median(away_prices)),
+        "books": books_used,
+    }
+
+
+# ============================================================
+# MODEL RANKING
+# ============================================================
+
+def get_best_market(prediction, home_name, away_name):
+    markets = prediction["markets"]
+
+    choices = [
+        (
+            "Over 2.5 cartellini",
+            markets["match_O2.5"],
+        ),
+        (
+            "Under 3.5 cartellini",
+            markets["match_U3.5"],
+        ),
+        (
+            f"{home_name} Over 1.5 cartellini",
+            markets["home_team_O1.5"],
+        ),
+        (
+            f"{home_name} Under 1.5 cartellini",
+            markets["home_team_U1.5"],
+        ),
+        (
+            f"{away_name} Over 1.5 cartellini",
+            markets["away_team_O1.5"],
+        ),
+        (
+            f"{away_name} Under 1.5 cartellini",
+            markets["away_team_U1.5"],
+        ),
+    ]
+
+    market, probability = max(
+        choices,
+        key=lambda x: x[1],
+    )
+
+    return market, float(probability)
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(TZ_ITALY)
+
+    except Exception:
+        return None
+
+
+def kickoff_label(dt):
+    if not dt:
+        return "Orario N/D"
+
+    return dt.strftime(
+        "%d/%m/%Y • %H:%M"
+    )
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def build_auto_scanner():
+    tournament_map, missing_tournaments = (
+        resolve_big5_tournaments()
+    )
+
+    if not tournament_map:
+        raise RuntimeError(
+            "Non sono riuscito a identificare i campionati Big Five su OddsPapi."
+        )
+
+    fixtures = fetch_upcoming_fixtures()
+
+    target_ids = set(
+        tournament_map.keys()
+    )
+
+    big5_fixtures = []
+
+    for fixture in fixtures:
+        try:
+            tournament_id = int(
+                fixture.get("tournamentId")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if tournament_id not in target_ids:
+            continue
+
+        big5_fixtures.append(fixture)
+
+    odds_items = fetch_big5_odds(
+        tuple(sorted(target_ids))
+    )
+
+    odds_by_fixture = {
+        str(item.get("fixtureId")): item
+        for item in odds_items
+        if item.get("fixtureId")
+    }
+
+    rankings = []
+    skipped = []
+
+    for fixture in big5_fixtures:
+        fixture_id = str(
+            fixture.get("fixtureId")
+        )
+
+        tournament_id = int(
+            fixture.get("tournamentId")
+        )
+
+        cfg = tournament_map[
+            tournament_id
+        ]
+
+        api_home = (
+            fixture.get("participant1Name")
+            or ""
+        )
+
+        api_away = (
+            fixture.get("participant2Name")
+            or ""
+        )
+
+        if not api_home or not api_away:
+            skipped.append({
+                "Partita": fixture_id,
+                "Motivo": "Nomi squadre mancanti",
+            })
+            continue
+
+        model_home = match_model_team(
+            api_home,
+            cfg["model_id"],
+        )
+
+        model_away = match_model_team(
+            api_away,
+            cfg["model_id"],
+        )
+
+        if not model_home or not model_away:
+            skipped.append({
+                "Partita": f"{api_home} - {api_away}",
+                "Motivo": "Squadra non riconosciuta dal bundle V8.1",
+            })
+            continue
+
+        odds_item = odds_by_fixture.get(
+            fixture_id
+        )
+
+        if not odds_item:
+            skipped.append({
+                "Partita": f"{api_home} - {api_away}",
+                "Motivo": "Quote OddsPapi non trovate",
+            })
+            continue
+
+        odds = extract_1x2(
+            odds_item
+        )
+
+        if not odds:
+            skipped.append({
+                "Partita": f"{api_home} - {api_away}",
+                "Motivo": "1X2 Pinnacle/SBOBET non disponibile",
+            })
+            continue
+
+        try:
             result = predict_match(
                 bundle=bundle,
-                league=fixture[
-                    "league_model"
-                ],
-                home=fixture[
-                    "model_home"
-                ],
-                away=fixture[
-                    "model_away"
-                ],
+                league=cfg["model_id"],
+                home=model_home,
+                away=model_away,
                 oddsH=odds["home"],
                 oddsD=odds["draw"],
                 oddsA=odds["away"],
@@ -758,106 +707,54 @@ def run_scanner(days):
                 official=False,
             )
 
-            market_name, probability = (
-                best_market(
+            market, probability = (
+                get_best_market(
                     result,
-                    fixture[
-                        "api_home"
-                    ],
-                    fixture[
-                        "api_away"
-                    ],
+                    api_home,
+                    api_away,
                 )
             )
 
-            coverage, home_n, away_n = (
-                historical_coverage(
-                    fixture[
-                        "league_model"
-                    ],
-                    fixture[
-                        "model_home"
-                    ],
-                    fixture[
-                        "model_away"
-                    ],
-                )
-            )
-
-            # Lo score è dominato dalla probabilità,
-            # con una penalizzazione piccola se lo
-            # storico disponibile è incompleto.
-            ranking_score = (
-                probability
-                * (
-                    0.90
-                    + 0.10 * coverage
-                )
+            kickoff_dt = parse_datetime(
+                fixture.get("startTime")
             )
 
             rankings.append({
-                "fixture_id":
-                    fixture_id,
-                "league":
-                    fixture[
-                        "league_name"
-                    ],
-                "home":
-                    fixture[
-                        "api_home"
-                    ],
-                "away":
-                    fixture[
-                        "api_away"
-                    ],
-                "kickoff":
-                    parse_kickoff(
-                        fixture[
-                            "kickoff_raw"
-                        ]
-                    ),
-                "market":
-                    market_name,
-                "probability":
-                    float(
-                        probability
-                    ),
-                "score":
-                    float(
-                        ranking_score
-                    ),
-                "history":
-                    f"{home_n}/20 + {away_n}/20",
-                "odds_home":
-                    odds["home"],
-                "odds_draw":
-                    odds["draw"],
-                "odds_away":
-                    odds["away"],
-                "bookmakers":
-                    odds["bookmakers"],
+                "fixture_id": fixture_id,
+                "league": cfg["display_name"],
+                "home": api_home,
+                "away": api_away,
+                "kickoff_dt": kickoff_dt,
+                "kickoff": kickoff_label(kickoff_dt),
+                "market": market,
+                "probability": probability,
+                "score": probability,
+                "odds_h": odds["home"],
+                "odds_d": odds["draw"],
+                "odds_a": odds["away"],
+                "books": ", ".join(odds["books"]),
             })
 
         except Exception as exc:
-
             skipped.append({
-                "match":
-                    f"{fixture['api_home']} - {fixture['api_away']}",
-                "reason":
-                    f"Errore modello: {exc}",
+                "Partita": f"{api_home} - {api_away}",
+                "Motivo": f"Errore V8.1: {exc}",
             })
 
     rankings.sort(
         key=lambda x: x["score"],
-        reverse=True
+        reverse=True,
     )
 
-    return (
-        rankings,
-        skipped,
-        len(fixtures),
-        season,
-    )
+    return {
+        "rankings": rankings,
+        "skipped": skipped,
+        "fixtures_found": len(big5_fixtures),
+        "missing_tournaments": missing_tournaments,
+        "generated_at": datetime.now(
+            TZ_ITALY
+        ).strftime("%d/%m/%Y %H:%M"),
+    }
 
 
 # ============================================================
@@ -873,72 +770,65 @@ st.divider()
 
 st.header("⚡ Auto Scanner Big Five")
 
-c1, c2 = st.columns(2)
+if not ODDSPAPI_KEY:
+    st.error(
+        "ODDSPAPI_KEY non configurata su Render."
+    )
+    st.stop()
 
-with c1:
 
-    scan_days = st.selectbox(
+col_a, col_b = st.columns(2)
+
+with col_a:
+    days_filter = st.selectbox(
         "Intervallo partite",
-        [
-            3,
-            5,
-            7
-        ],
+        [3, 5, 7],
         index=1,
-        format_func=lambda x:
-            f"Prossimi {x} giorni"
+        format_func=lambda x: f"Prossimi {x} giorni",
     )
 
-with c2:
-
+with col_b:
     minimum_probability = st.slider(
         "Probabilità minima selezione",
         min_value=0.55,
-        max_value=0.85,
+        max_value=0.90,
         value=0.65,
         step=0.01,
         format="%.2f",
     )
 
 
-if not API_KEY:
-
-    st.error(
-        "API_FOOTBALL_KEY non configurata su Render."
-    )
-
-    st.stop()
-
-
 with st.spinner(
-    "Analizzo le prossime partite dei Big Five..."
+    "Recupero partite e quote OddsPapi e analizzo con V8.1..."
 ):
-
     try:
-
-        (
-            rankings,
-            skipped,
-            fixture_count,
-            season
-        ) = run_scanner(
-            scan_days
-        )
-
+        scanner = build_auto_scanner()
     except Exception as exc:
-
         st.error(
-            "Errore durante il recupero dei dati."
+            "Errore durante l'Auto Scanner."
         )
-
         st.exception(exc)
-
         st.stop()
 
 
+now_italy = datetime.now(TZ_ITALY)
+
+cutoff = now_italy + timedelta(
+    days=days_filter
+)
+
+rankings = [
+    r for r in scanner["rankings"]
+    if (
+        r["kickoff_dt"] is not None
+        and now_italy
+        <= r["kickoff_dt"]
+        <= cutoff
+    )
+]
+
 eligible = [
-    r
-    for r in rankings
+    r for r in rankings
     if r["probability"]
     >= minimum_probability
 ]
@@ -947,24 +837,34 @@ eligible = [
 m1, m2, m3, m4 = st.columns(4)
 
 m1.metric(
-    "Partite trovate",
-    fixture_count
+    "Partite Big Five",
+    scanner["fixtures_found"],
 )
 
 m2.metric(
-    "Analizzate V8.1",
-    len(rankings)
+    f"Nei prossimi {days_filter} gg",
+    len(rankings),
 )
 
 m3.metric(
     "Sopra soglia",
-    len(eligible)
+    len(eligible),
 )
 
 m4.metric(
-    "Stagione",
-    f"{season}/{str(season + 1)[-2:]}"
+    "Ultimo aggiornamento",
+    scanner["generated_at"],
 )
+
+
+if scanner["missing_tournaments"]:
+    st.warning(
+        "Campionati OddsPapi non identificati: "
+        + ", ".join(
+            scanner["missing_tournaments"]
+        )
+    )
+
 
 st.divider()
 
@@ -976,67 +876,49 @@ st.divider()
 st.subheader("🏆 Tripla V8.1")
 
 if len(eligible) >= 3:
-
     top3 = eligible[:3]
 
-    for i, pick in enumerate(
+    for index, pick in enumerate(
         top3,
-        1
+        start=1,
     ):
-
-        with st.container(
-            border=True
-        ):
+        with st.container(border=True):
 
             st.markdown(
-                f"### {i}. "
-                f"{pick['home']} – "
-                f"{pick['away']}"
+                f"### {index}. "
+                f"{pick['home']} – {pick['away']}"
             )
 
             st.caption(
-                f"{pick['league']} • "
-                f"{pick['kickoff']}"
+                f"{pick['league']} • {pick['kickoff']}"
             )
 
-            a, b, c = st.columns(3)
+            c1, c2 = st.columns(2)
 
-            a.metric(
-                "Mercato",
-                pick[
-                    "market"
-                ]
+            c1.metric(
+                "Selezione V8.1",
+                pick["market"],
             )
 
-            b.metric(
-                "Probabilità V8.1",
-                pct(
-                    pick[
-                        "probability"
-                    ]
-                )
-            )
-
-            c.metric(
-                "Storico",
-                pick[
-                    "history"
-                ]
+            c2.metric(
+                "Probabilità",
+                pct(pick["probability"]),
             )
 
             st.caption(
-                "Quote 1X2 usate dal modello: "
-                f"1 {pick['odds_home']:.2f} • "
-                f"X {pick['odds_draw']:.2f} • "
-                f"2 {pick['odds_away']:.2f} "
-                f"({pick['bookmakers']} bookmaker)"
+                f"Input 1X2: "
+                f"1 {pick['odds_h']:.2f} • "
+                f"X {pick['odds_d']:.2f} • "
+                f"2 {pick['odds_a']:.2f}"
+            )
+
+            st.caption(
+                f"Fonte quote: {pick['books'] or 'OddsPapi'}"
             )
 
 else:
-
     st.warning(
-        "Non ci sono almeno 3 selezioni "
-        "che superano la soglia impostata."
+        "Non ci sono almeno 3 selezioni sopra la soglia impostata."
     )
 
 
@@ -1047,60 +929,49 @@ else:
 st.subheader("🔥 Quadrupla V8.1")
 
 if len(eligible) >= 4:
-
     top4 = eligible[:4]
 
-    for i, pick in enumerate(
+    for index, pick in enumerate(
         top4,
-        1
+        start=1,
     ):
-
-        with st.container(
-            border=True
-        ):
+        with st.container(border=True):
 
             st.markdown(
-                f"**{i}. "
-                f"{pick['home']} – "
-                f"{pick['away']}**"
+                f"**{index}. "
+                f"{pick['home']} – {pick['away']}**"
             )
 
             st.write(
-                f"**{pick['market']}**"
+                f"🎯 **{pick['market']}**"
             )
 
             st.write(
-                "Probabilità modello: "
+                f"Probabilità V8.1: "
                 f"**{pct(pick['probability'])}**"
             )
 
             st.caption(
-                f"{pick['league']} • "
-                f"{pick['kickoff']}"
+                f"{pick['league']} • {pick['kickoff']}"
             )
 
 else:
-
     st.warning(
-        "Non ci sono almeno 4 selezioni "
-        "che superano la soglia impostata."
+        "Non ci sono almeno 4 selezioni sopra la soglia impostata."
     )
 
 
 # ============================================================
-# ALL ANALYSES
+# ALL MATCHES
 # ============================================================
 
 with st.expander(
     "📊 Tutte le partite analizzate"
 ):
-
     if rankings:
-
         table = []
 
         for r in rankings:
-
             table.append({
                 "Partita":
                     f"{r['home']} - {r['away']}",
@@ -1111,22 +982,13 @@ with st.expander(
                 "Mercato migliore":
                     r["market"],
                 "Probabilità":
-                    pct(
-                        r[
-                            "probability"
-                        ]
-                    ),
-                "Score":
-                    round(
-                        r[
-                            "score"
-                        ],
-                        3
-                    ),
-                "Storico":
-                    r[
-                        "history"
-                    ],
+                    pct(r["probability"]),
+                "1":
+                    round(r["odds_h"], 2),
+                "X":
+                    round(r["odds_d"], 2),
+                "2":
+                    round(r["odds_a"], 2),
             })
 
         st.dataframe(
@@ -1134,28 +996,22 @@ with st.expander(
             use_container_width=True,
             hide_index=True,
         )
-
     else:
-
         st.info(
-            "Nessuna partita analizzabile."
+            "Nessuna partita analizzabile nell'intervallo selezionato."
         )
 
 
 with st.expander(
-    "⚠️ Partite non analizzate"
+    "⚠️ Partite saltate / diagnostica"
 ):
-
-    if skipped:
-
+    if scanner["skipped"]:
         st.dataframe(
-            skipped,
+            scanner["skipped"],
             use_container_width=True,
             hide_index=True,
         )
-
     else:
-
         st.success(
             "Nessuna partita saltata."
         )
@@ -1170,164 +1026,121 @@ st.divider()
 with st.expander(
     "🧪 Analisi manuale"
 ):
-
-    manual_league_name = st.selectbox(
+    league_name = st.selectbox(
         "Campionato",
-        list(
-            BIG5.keys()
-        ),
+        list(BIG5.keys()),
         key="manual_league",
     )
 
-    manual_league = BIG5[
-        manual_league_name
+    league_code = BIG5[
+        league_name
     ]["model_id"]
 
     teams = get_model_teams(
-        manual_league
+        league_code
     )
 
-    col1, col2 = st.columns(2)
+    c1, c2 = st.columns(2)
 
-    with col1:
-
+    with c1:
         home = st.selectbox(
             "Squadra casa",
             teams,
             key="manual_home",
         )
 
-    with col2:
+    away_options = [
+        team for team in teams
+        if team != home
+    ]
 
-        away_options = [
-            t
-            for t in teams
-            if t != home
-        ]
-
+    with c2:
         away = st.selectbox(
             "Squadra ospite",
             away_options,
             key="manual_away",
         )
 
-    st.write("### Quote 1X2")
+    o1, ox, o2 = st.columns(3)
 
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-
-        oddsH = st.number_input(
-            "1",
+    with o1:
+        odds_h = st.number_input(
+            "Quota 1",
             min_value=1.01,
             value=2.00,
             step=0.05,
-            key="manual_odds_h",
         )
 
-    with c2:
-
-        oddsD = st.number_input(
-            "X",
+    with ox:
+        odds_d = st.number_input(
+            "Quota X",
             min_value=1.01,
             value=3.30,
             step=0.05,
-            key="manual_odds_d",
         )
 
-    with c3:
-
-        oddsA = st.number_input(
-            "2",
+    with o2:
+        odds_a = st.number_input(
+            "Quota 2",
             min_value=1.01,
             value=3.50,
             step=0.05,
-            key="manual_odds_a",
         )
 
     if st.button(
         "Analizza manualmente",
         use_container_width=True,
     ):
-
         result = predict_match(
             bundle=bundle,
-            league=manual_league,
+            league=league_code,
             home=home,
             away=away,
-            oddsH=oddsH,
-            oddsD=oddsD,
-            oddsA=oddsA,
+            oddsH=odds_h,
+            oddsD=odds_d,
+            oddsA=odds_a,
             referee=None,
             official=False,
         )
 
-        markets = result[
-            "markets"
-        ]
+        markets = result["markets"]
 
         st.success(
             f"{home} vs {away}"
         )
 
-        x1, x2 = st.columns(2)
+        a, b = st.columns(2)
 
-        with x1:
-
+        with a:
             st.metric(
                 "Over 2.5 cartellini",
-                pct(
-                    markets[
-                        "match_O2.5"
-                    ]
-                )
+                pct(markets["match_O2.5"]),
             )
 
             st.metric(
                 f"{home} Over 1.5",
-                pct(
-                    markets[
-                        "home_team_O1.5"
-                    ]
-                )
+                pct(markets["home_team_O1.5"]),
             )
 
             st.metric(
                 f"{away} Over 1.5",
-                pct(
-                    markets[
-                        "away_team_O1.5"
-                    ]
-                )
+                pct(markets["away_team_O1.5"]),
             )
 
-        with x2:
-
+        with b:
             st.metric(
                 "Under 3.5 cartellini",
-                pct(
-                    markets[
-                        "match_U3.5"
-                    ]
-                )
+                pct(markets["match_U3.5"]),
             )
 
             st.metric(
                 f"{home} Under 1.5",
-                pct(
-                    markets[
-                        "home_team_U1.5"
-                    ]
-                )
+                pct(markets["home_team_U1.5"]),
             )
 
             st.metric(
                 f"{away} Under 1.5",
-                pct(
-                    markets[
-                        "away_team_U1.5"
-                    ]
-                )
+                pct(markets["away_team_U1.5"]),
             )
 
 
@@ -1335,6 +1148,6 @@ st.divider()
 
 st.caption(
     "V8.1 Cards Model • "
-    "Yellow cards only • "
-    "Pre-match probabilities"
+    "Fixtures & 1X2: OddsPapi • "
+    "Yellow cards only"
 )
